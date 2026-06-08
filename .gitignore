@@ -1,0 +1,19 @@
+# Build artifacts
+*.bin
+*.elf
+*.map
+build/
+.build/
+
+# Arduino IDE
+*.hex
+
+# Local config / secrets (should never exist here, but just in case)
+secrets.h
+config.local.*
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
+*.swp
