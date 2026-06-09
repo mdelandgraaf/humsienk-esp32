@@ -57,7 +57,7 @@ static const char*    AP_SSID         = "Humsienk-Setup";
 static const char*    AP_PASS         = "batterymon";   // >= 8 chars
 static const uint32_t POLL_INTERVAL_MS_DEFAULT = 30000;
 static const uint32_t SCREEN_CYCLE_MS = 4000;
-static const uint32_t CONNECT_TIMEOUT_MS = 8000;
+static const uint32_t CONNECT_TIMEOUT_MS = 4000;   // keep a stalled/sleeping battery from blocking the whole sweep
 static const uint32_t REQUEST_TIMEOUT_MS = 2500;
 
 // TTGO T-Display V1.1 buttons
@@ -401,20 +401,34 @@ static void scanForBatteries(uint32_t durationMs = 5000) {
 WiFiClientSecure secureClient;
 WiFiClient plainClient;
 
+// One persistent HTTPClient kept alive across all the POSTs in a sweep. With
+// setReuse(true) the underlying TCP/TLS socket stays open, so the (expensive,
+// ~1-2s over Nabu Casa) TLS handshake is paid roughly once per sweep instead
+// of once per entity. This is the single biggest win for REST publish speed.
+static HTTPClient httpHA;
+
+// Per-battery change tracking so we only POST protection/warning flags that
+// actually changed, instead of all ~30 every cycle. A periodic full refresh
+// self-heals any missed update.
+static uint32_t lastStatusBitsPub[MAX_BATTERIES] = {0};
+static bool     statusEverPub[MAX_BATTERIES]     = {false};
+static uint16_t haSweepCounter = 0;
+static const uint16_t HA_FLAG_FULL_REFRESH_EVERY = 10;   // force-publish all flags every N sweeps
+
 static bool postSensor(const char* entity_id, const char* state, const char* unit,
                        const char* device_class, const char* friendly_name) {
     if (!cfg.haEnabled || cfg.haUrl.isEmpty() || cfg.haToken.isEmpty()) return false;
     String url = cfg.haUrl + "/api/states/" + entity_id;
-    HTTPClient http;
-    http.setTimeout(8000);
+    httpHA.setReuse(true);          // keep-alive: reuse the socket for the next entity
+    httpHA.setTimeout(5000);
     bool ok;
     if (cfg.haUrl.startsWith("https"))
-        ok = http.begin(secureClient, url);
+        ok = httpHA.begin(secureClient, url);
     else
-        ok = http.begin(plainClient, url);
+        ok = httpHA.begin(plainClient, url);
     if (!ok) return false;
-    http.addHeader("Authorization", String("Bearer ") + cfg.haToken);
-    http.addHeader("Content-Type", "application/json");
+    httpHA.addHeader("Authorization", String("Bearer ") + cfg.haToken);
+    httpHA.addHeader("Content-Type", "application/json");
     JsonDocument body;
     body["state"] = state;
     JsonObject attr = body["attributes"].to<JsonObject>();
@@ -425,12 +439,12 @@ static bool postSensor(const char* entity_id, const char* state, const char* uni
     }
     attr["friendly_name"] = friendly_name;
     String payload; serializeJson(body, payload);
-    int code = http.POST(payload);
-    http.end();
+    int code = httpHA.POST(payload);
+    httpHA.end();                   // with reuse=true this keeps the connection open
     return (code == 200 || code == 201);
 }
 
-static void publishBattery(const String& name, const BatterySnapshot& s) {
+static void publishBattery(uint8_t idx, const String& name, const BatterySnapshot& s) {
     char ent[64], fname[64], vbuf[32];
     #define PUB(suffix, unit, dclass, label) do { \
         snprintf(ent,   sizeof(ent),   "sensor.%s_" suffix, name.c_str()); \
@@ -450,17 +464,25 @@ static void publishBattery(const String& name, const BatterySnapshot& s) {
     if (s.status_valid) {
         snprintf(vbuf, sizeof(vbuf), "%s", s.chargeFetOn ? "on" : "off");    PUB("charge_fet",    "", "", "Charge FET");
         snprintf(vbuf, sizeof(vbuf), "%s", s.dischargeFetOn ? "on" : "off"); PUB("discharge_fet", "", "", "Discharge FET");
-        // All protection/warning flags as on/off states.
+        // Protection/warning flags as on/off. These almost never change, so only
+        // POST the ones that flipped since last publish (with a periodic full
+        // refresh). This trims a steady-state sweep from ~42 to ~12 POSTs/battery.
+        bool forceAll = !statusEverPub[idx] ||
+                        (haSweepCounter % HA_FLAG_FULL_REFRESH_EVERY == 0);
+        uint32_t changed = s.status_bits ^ lastStatusBitsPub[idx];
         for (uint8_t k = 0; k < STATUS_FLAG_COUNT; k++) {
             const StatusFlag& fl = STATUS_FLAGS[k];
             // Skip the FET-on bits already published above (7,23) and informational on-states
             if (fl.bit == 7 || fl.bit == 23) continue;
+            if (!forceAll && !((changed >> fl.bit) & 1)) continue;   // unchanged -> skip
             bool active = (s.status_bits >> fl.bit) & 1;
             char ent2[80], fname2[96];
             snprintf(ent2,   sizeof(ent2),   "sensor.%s_%s", name.c_str(), fl.key);
             snprintf(fname2, sizeof(fname2), "%s %s", name.c_str(), fl.name);
             postSensor(ent2, active ? "on" : "off", "", "", fname2);
         }
+        lastStatusBitsPub[idx] = s.status_bits;
+        statusEverPub[idx]     = true;
     }
     #undef PUB
 }
@@ -1015,6 +1037,7 @@ void loop() {
     if (!apMode && cfg.batteryCount > 0 &&
         (lastPollMs == 0 || (millis() - lastPollMs) >= cfg.pollMs)) {
         lastPollMs = millis();
+        haSweepCounter++;
         for (uint8_t i = 0; i < cfg.batteryCount; i++) {
             if (cfg.batMac[i].isEmpty()) continue;
             BmsClient bms;
@@ -1029,7 +1052,7 @@ void loop() {
                 Serial.printf("[%s] V=%.2f I=%.2f SOC=%u%% chgFET=%d disFET=%d\n",
                     cfg.batName[i].c_str(), fresh.voltage_v, fresh.current_a, fresh.soc,
                     fresh.chargeFetOn, fresh.dischargeFetOn);
-                publishBattery(cfg.batName[i], fresh);
+                publishBattery(i, cfg.batName[i], fresh);
                 if (cfg.mqttEnabled && mqtt.connected()) mqttPublishState(i, fresh);
             } else {
                 Serial.printf("[%s] read failed\n", cfg.batName[i].c_str());
