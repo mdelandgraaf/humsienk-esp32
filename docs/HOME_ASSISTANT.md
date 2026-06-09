@@ -27,6 +27,34 @@ Enable "REST publishing" and set the HA URL plus a Long-Lived Access Token
 > REST-created entities have no unique ID, so HA can't manage them from the UI. That's
 > expected and harmless. If you want full device grouping + switches, prefer MQTT.
 
+## Detecting an offline battery (`last_seen`)
+
+The firmware only publishes a battery's data after a **successful** BLE read — it never
+pushes 0/blank values when a battery is unreachable. The downside is that an offline
+battery's metrics just freeze at their last value rather than going `unavailable`.
+
+To make drop-offs visible, each successful read also updates a
+`sensor.<name>_last_seen` (`device_class: timestamp`). It stops advancing when the
+battery goes offline, so HA shows "x minutes ago" and you can alert on staleness.
+The device syncs time over NTP on boot, so the first reading may take a few seconds
+to appear after a cold start.
+
+```yaml
+automation:
+  - alias: "Battery 1 offline"
+    trigger:
+      - platform: template
+        # fires once last_seen is older than 10 minutes
+        value_template: >
+          {{ now() - states.sensor.battery1_last_seen.state | as_datetime
+             > timedelta(minutes=10) }}
+    action:
+      - service: notify.mobile_app_your_phone
+        data:
+          title: "Battery 1 offline"
+          message: "No BLE reading since {{ states('sensor.battery1_last_seen') }}"
+```
+
 ---
 
 ## Example: low-SOC notification

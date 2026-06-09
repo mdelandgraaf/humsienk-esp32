@@ -42,6 +42,7 @@
 #include <NimBLEDevice.h>
 #include <TFT_eSPI.h>
 #include <SPI.h>
+#include <time.h>   // NTP-synced wall clock for the "last seen" timestamp
 
 // ============================================================================
 // Forward declarations
@@ -444,6 +445,46 @@ static bool postSensor(const char* entity_id, const char* state, const char* uni
     return (code == 200 || code == 201);
 }
 
+// Current UTC time as ISO8601, or "" if NTP hasn't synced yet.
+static String isoNow() {
+    time_t now = time(nullptr);
+    if (now < 1700000000) return "";          // < ~2023-11 -> clock not set yet
+    struct tm tmv;
+    gmtime_r(&now, &tmv);
+    char buf[32];
+    strftime(buf, sizeof(buf), "%Y-%m-%dT%H:%M:%S+00:00", &tmv);
+    return String(buf);
+}
+
+// Publish a Home Assistant 'timestamp' sensor (no unit/state_class). Used for
+// the per-battery last_seen entity, which stops advancing when a battery drops
+// off so HA shows "x minutes ago" and you can alert on staleness.
+static bool postTimestampSensor(const char* entity_id, const char* iso,
+                                const char* friendly_name) {
+    if (!cfg.haEnabled || cfg.haUrl.isEmpty() || cfg.haToken.isEmpty()) return false;
+    if (!iso || !iso[0]) return false;
+    String url = cfg.haUrl + "/api/states/" + entity_id;
+    httpHA.setReuse(true);
+    httpHA.setTimeout(5000);
+    bool ok;
+    if (cfg.haUrl.startsWith("https"))
+        ok = httpHA.begin(secureClient, url);
+    else
+        ok = httpHA.begin(plainClient, url);
+    if (!ok) return false;
+    httpHA.addHeader("Authorization", String("Bearer ") + cfg.haToken);
+    httpHA.addHeader("Content-Type", "application/json");
+    JsonDocument body;
+    body["state"] = iso;
+    JsonObject attr = body["attributes"].to<JsonObject>();
+    attr["device_class"]  = "timestamp";
+    attr["friendly_name"] = friendly_name;
+    String payload; serializeJson(body, payload);
+    int code = httpHA.POST(payload);
+    httpHA.end();
+    return (code == 200 || code == 201);
+}
+
 static void publishBattery(uint8_t idx, const String& name, const BatterySnapshot& s) {
     char ent[64], fname[64], vbuf[32];
     #define PUB(suffix, unit, dclass, label) do { \
@@ -483,6 +524,15 @@ static void publishBattery(uint8_t idx, const String& name, const BatterySnapsho
         }
         lastStatusBitsPub[idx] = s.status_bits;
         statusEverPub[idx]     = true;
+    }
+    // last_seen: only updated on a successful read, so a battery that drops off
+    // leaves this frozen -> HA shows "x ago" and stops advancing.
+    String iso = isoNow();
+    if (iso.length()) {
+        char ent2[80], fname2[96];
+        snprintf(ent2,   sizeof(ent2),   "sensor.%s_last_seen", name.c_str());
+        snprintf(fname2, sizeof(fname2), "%s Last Seen", name.c_str());
+        postTimestampSensor(ent2, iso.c_str(), fname2);
     }
     #undef PUB
 }
@@ -989,6 +1039,8 @@ void setup() {
 
     if (connectWifi()) {
         Serial.print("WiFi OK: "); Serial.println(WiFi.localIP());
+        // Start NTP so the per-battery last_seen timestamp is real wall-clock time.
+        configTime(0, 0, "pool.ntp.org", "time.nist.gov");   // UTC; HA renders local
         drawStatusScreen("WiFi OK", WiFi.localIP().toString().c_str(), "web config on this IP");
         delay(1200);
     } else {
