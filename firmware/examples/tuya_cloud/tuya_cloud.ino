@@ -269,11 +269,11 @@ static bool ensureTuyaMqtt() {
     return ok;
 }
 
-static JsonObject addValue(JsonObject parent, const char* key, JsonVariant value, uint32_t ts) {
+template <typename T>
+static void addValue(JsonObject parent, const String& key, T value, uint32_t ts) {
     JsonObject obj = parent[key].to<JsonObject>();
     obj["value"] = value;
     obj["time"] = ts;
-    return obj;
 }
 
 static bool publishToTuya(const BatteryCfg& cfg, const BatterySnapshot& s) {
@@ -288,17 +288,17 @@ static bool publishToTuya(const BatteryCfg& cfg, const BatterySnapshot& s) {
     // Match the property names below to your Tuya custom product DP identifiers.
     JsonObject data = doc["data"].to<JsonObject>();
     String prefix = String(cfg.name) + "_";   // keep multi-battery names unique
-    addValue(data, (prefix + DP_SOC).c_str(), s.soc, ts);
-    addValue(data, (prefix + DP_VOLTAGE).c_str(), round(s.voltage_v * 1000.0f) / 1000.0f, ts);
-    addValue(data, (prefix + DP_CURRENT).c_str(), round(s.current_a * 1000.0f) / 1000.0f, ts);
-    addValue(data, (prefix + DP_POWER).c_str(), round(s.voltage_v * s.current_a * 10.0f) / 10.0f, ts);
-    addValue(data, (prefix + DP_TEMPERATURE).c_str(), (int)s.temp_c, ts);
-    addValue(data, (prefix + DP_SOH).c_str(), s.soh, ts);
-    addValue(data, (prefix + DP_REMAINING_AH).c_str(), round((s.remaining_mah / 1000.0f) * 100.0f) / 100.0f, ts);
-    addValue(data, (prefix + DP_CELL_DIFF_MV).c_str(), s.cell_diff_mv, ts);
+    addValue(data, prefix + DP_SOC, s.soc, ts);
+    addValue(data, prefix + DP_VOLTAGE, round(s.voltage_v * 1000.0f) / 1000.0f, ts);
+    addValue(data, prefix + DP_CURRENT, round(s.current_a * 1000.0f) / 1000.0f, ts);
+    addValue(data, prefix + DP_POWER, round(s.voltage_v * s.current_a * 10.0f) / 10.0f, ts);
+    addValue(data, prefix + DP_TEMPERATURE, (int)s.temp_c, ts);
+    addValue(data, prefix + DP_SOH, s.soh, ts);
+    addValue(data, prefix + DP_REMAINING_AH, round((s.remaining_mah / 1000.0f) * 100.0f) / 100.0f, ts);
+    addValue(data, prefix + DP_CELL_DIFF_MV, s.cell_diff_mv, ts);
     if (s.status_valid) {
-        addValue(data, (prefix + DP_CHARGE_FET).c_str(), s.chargeFetOn, ts);
-        addValue(data, (prefix + DP_DISCHARGE_FET).c_str(), s.dischargeFetOn, ts);
+        addValue(data, prefix + DP_CHARGE_FET, s.chargeFetOn, ts);
+        addValue(data, prefix + DP_DISCHARGE_FET, s.dischargeFetOn, ts);
     }
 
     char payload[1800];
@@ -308,7 +308,7 @@ static bool publishToTuya(const BatteryCfg& cfg, const BatterySnapshot& s) {
         return false;
     }
 
-    bool ok = tuyaMqtt.publish(TUYA_PUBLISH_TOPIC, payload, n);
+    bool ok = tuyaMqtt.publish(TUYA_PUBLISH_TOPIC, (const uint8_t*)payload, (unsigned int)n);
     Serial.printf("[%s] Tuya publish %s (%u bytes)\n", cfg.name, ok ? "ok" : "failed", (unsigned)n);
     return ok;
 }
