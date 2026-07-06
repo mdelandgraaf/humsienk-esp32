@@ -1,12 +1,31 @@
-# Tuya Cloud MQTT publishing
+# Tuya Cloud custom ESP32 device
 
-This repository now includes a first Tuya Cloud publishing example at:
+This repository includes a Tuya Cloud publishing example at:
 
 ```text
 firmware/examples/tuya_cloud/tuya_cloud.ino
 ```
 
-It polls the Humsienk BMC batteries over BLE and publishes the readings to a Tuya MQTT endpoint or a Tuya MQTT gateway.
+It is meant for a **custom ESP32 IoT device** created in the Tuya IoT Platform. You do **not** need an existing Tuya plug, sensor, gateway, or Smart Life device.
+
+The ESP32 itself becomes the cloud-connected custom device:
+
+```text
+Humsienk battery --BLE--> ESP32 --MQTT/TLS--> Tuya Cloud
+```
+
+## Tuya side
+
+Create a custom product in Tuya IoT Platform and add a custom device under that product. You will need the credentials/details Tuya gives for that custom device, typically:
+
+- MQTT host / endpoint
+- MQTT port, usually TLS port `8883`
+- Device ID or client ID
+- Device secret / MQTT password / token
+- Property report topic
+- Product property identifiers / datapoint identifiers
+
+Exact names differ between Tuya project types and regions, but the firmware only needs the final MQTT connection details and the topic that accepts property reports.
 
 ## What it sends
 
@@ -36,7 +55,7 @@ battery2_voltage
 
 Create matching custom product property identifiers in Tuya, or change the identifiers in the sketch.
 
-## Configuration
+## Configuration in the ESP32 sketch
 
 Edit these fields in `tuya_cloud.ino`:
 
@@ -76,7 +95,7 @@ The sketch publishes JSON in this shape:
 }
 ```
 
-Tuya product setups can differ by project type. If your Tuya product expects another envelope, only change `publishToTuya()`; the BLE reader and snapshot fields can stay the same.
+If your Tuya custom device expects another envelope, only change `publishToTuya()`; the BLE reader and snapshot fields can stay the same.
 
 ## TLS note
 
