@@ -13,11 +13,11 @@ batteries into Home Assistant, and it gets better with more hardware variety beh
 - **Additional decoded fields** — e.g. mapping the `0x58` parameter/threshold block, or the
   cell-balance / disconnection bit arrays in the `0x20` response.
 - **Ports** to other ESP32 displays or to a headless (no-display) build.
-- **Bug fixes** and reliability improvements (BLE reconnect logic, MQTT edge cases, etc.).
+- **Bug fixes** and reliability improvements (BLE reconnect logic, REST edge cases, etc.).
 
 ## Ground rules
 
-- **Don't commit secrets.** No Wi-Fi passwords, HA tokens, MQTT creds, or real device MACs
+- **Don't commit secrets.** No Wi-Fi passwords, HA tokens, or real device MACs
   in code, issues, or screenshots. All config is runtime (web portal / NVS) for this reason.
 - **No copyrighted/third-party app code or assets.** This repo documents an
   interoperability protocol and ships only original firmware. Keep it that way.
@@ -28,8 +28,8 @@ batteries into Home Assistant, and it gets better with more hardware variety beh
 
 ## Testing a change
 
-Please note in your PR what you tested against (board, number of batteries, MQTT and/or
-REST) and include serial output if it's behaviour-related.
+Please note in your PR what you tested against (board, number of batteries, web page
+and/or REST) and include serial output if it's behaviour-related.
 
 ## Safety
 

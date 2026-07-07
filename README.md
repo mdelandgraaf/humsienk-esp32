@@ -1,9 +1,10 @@
 # Humsienk BMS Monitor (ESP32)
 
 Read your **Humsienk LiFePO4 batteries** over Bluetooth with an ESP32, show them on a
-LilyGO TTGO T-Display, and push the data to **Home Assistant** (REST or MQTT). Includes
-full charge/discharge MOSFET control and decoded protection/warning flags — everything
-the official "HumsiENK Smart BMS" app does, but local, open, and integrable.
+LilyGO TTGO T-Display and on the device's own **web page**, and push the data to
+**Home Assistant** over REST. Includes full charge/discharge MOSFET control and decoded
+protection/warning flags — everything the official "HumsiENK Smart BMS" app does, but
+local, open, and integrable.
 
 The Humsienk "BMC" BLE protocol was reverse-engineered from the official Android app;
 the full protocol is documented in [`docs/PROTOCOL.md`](docs/PROTOCOL.md) so anyone can
@@ -26,16 +27,16 @@ build their own client.
 - **Live values:** pack voltage, current (signed), SOC, SOH, remaining/full capacity,
   cycle count, temperatures, per-cell min/max/delta.
 - **Charge & discharge FET control** — toggle the battery MOSFETs like the app does.
-- **All 32 BMS status flags decoded** — protections and warnings exposed as binary
-  sensors (over/under voltage, over/under temperature, overcurrent, short-circuit,
-  AFE error, MOS over-temp, etc.).
-- **Home Assistant integration two ways:**
-  - **MQTT** with auto-discovery (sensors, switches, and binary sensors appear
-    automatically, no YAML).
-  - **REST API** (works great with a Nabu Casa URL + long-lived token).
+- **All 32 BMS status flags decoded** — protections and warnings (over/under voltage,
+  over/under temperature, overcurrent, short-circuit, AFE error, MOS over-temp, etc.).
+- **Live web page** — the device serves a page showing every battery's SOC (with a
+  colour-coded bar), voltage, current, power, temperature, capacity, cycles, FET states,
+  and active faults. It auto-refreshes and needs no Home Assistant.
+- **Home Assistant integration** via the **REST API** (works great with a Nabu Casa URL
+  + long-lived token).
 - **On-device display** (TTGO T-Display): cycles through batteries, colour-coded SOC,
   current direction, temperature, and a fault line.
-- **Web configuration portal** — set Wi-Fi, HA, MQTT, and batteries from a browser.
+- **Web configuration portal** — set Wi-Fi, HA, and batteries from a browser.
   No recompiling to change settings, no secrets baked into the firmware.
 - **Captive-portal AP mode** on first boot or when Wi-Fi is unavailable.
 - **BLE scan-and-add** — the web UI finds nearby `HS...` batteries and adds them with a tap.
@@ -61,7 +62,6 @@ ESP32 from any USB source within Bluetooth range of the packs.
 2. **Install libraries** (Library Manager):
    - `NimBLE-Arduino` (h2zero) — v2.x
    - `ArduinoJson` (Benoit Blanchon) — v7+
-   - `PubSubClient` (Nick O'Leary) — for MQTT
    - `TFT_eSPI` (Bodmer) — for the display
 3. **Configure TFT_eSPI** for the T-Display: in
    `Documents/Arduino/libraries/TFT_eSPI/User_Setup_Select.h`, comment out the default
@@ -79,32 +79,33 @@ ESP32 from any USB source within Bluetooth range of the packs.
 
 1. Connect a phone/laptop to the Wi-Fi network **`Humsienk-Setup`** (password `batterymon`).
 2. A configuration page should pop up automatically (or browse to `http://192.168.4.1`).
-3. Enter your Wi-Fi credentials, your Home Assistant URL + token and/or MQTT broker.
+3. Enter your Wi-Fi credentials and (optionally) your Home Assistant URL + token.
 4. Hit **Scan now** to find nearby `HS...` batteries, tick them, **Add selected**.
 5. **Save & Reboot.** The device connects to your network; the config page stays
    reachable at the device's IP (shown on the display and serial monitor).
 
 ---
 
-## Home Assistant
+## Live web page
 
-### Option A — MQTT (recommended for local/fast updates)
+Point a browser at the device's IP (shown on the display and serial monitor). The top of
+the page shows a **live view of every battery** — SOC with a colour-coded bar, voltage,
+current, power, temperature, remaining capacity, SOH, cycles, cell diff, the charge/
+discharge FET states, and any active protection/warning flags. It refreshes on its own
+every few seconds and needs no Home Assistant.
 
-Enable MQTT in the web config and point it at your broker (e.g. the Mosquitto add-on).
-With MQTT enabled, the firmware publishes Home Assistant **auto-discovery** messages, so
-a device called e.g. *battery1* appears automatically with:
-
-- Sensors: SOC, voltage, current, power, temperature, remaining capacity, SOH, cell-diff.
-- Switches: **Charge FET**, **Discharge FET**.
-- Binary sensors: every protection/warning flag, with `device_class: problem` so they go
-  red when active.
-
-### Option B — REST API (works with Nabu Casa)
+## Home Assistant (REST API, works with Nabu Casa)
 
 Enable "REST publishing" and provide your HA URL (e.g. `https://xxxx.ui.nabu.casa`) and a
-**Long-Lived Access Token** (HA → profile → Security → Long-Lived Access Tokens). Entities
-are created on first POST. Note: REST-created entities have no unique ID, so HA can't manage
-them from the UI — this is normal and harmless. MQTT is the cleaner path if you have a broker.
+**Long-Lived Access Token** (HA → profile → Security → Long-Lived Access Tokens). A set of
+`sensor.<name>_*` entities (SOC, voltage, current, power, temperature, capacity, SOH,
+cycles, cell diff, FET states, and each protection/warning flag) is created on first POST.
+
+> REST-created entities have no unique ID, so HA can't manage them from the UI — this is
+> normal and harmless. Charge/discharge control is done from the device's own web page.
+
+See [`docs/HOME_ASSISTANT.md`](docs/HOME_ASSISTANT.md) for entity names, automations, and a
+dashboard example.
 
 ---
 
@@ -114,9 +115,8 @@ This firmware can switch the battery's charge and discharge MOSFETs.
 
 - **Disabling the discharge FET cuts power to whatever the battery feeds** (e.g. an inverter).
 - **Disabling the charge FET stops charging.**
-- The web UI guards these with confirmation dialogs, and MQTT switches are explicit, but
-  there is no undo. Don't expose the switches somewhere they can be hit by accident if
-  something critical runs off the pack.
+- The web UI guards these with confirmation dialogs, but there is no undo. Don't expose
+  the switches somewhere they can be hit by accident if something critical runs off the pack.
 
 LiFePO4 packs store a lot of energy. This project talks to a safety-critical device that
 you did not get full documentation for. **Use at your own risk.** The protection/warning
@@ -146,9 +146,8 @@ of the `0x21` response — it may be an easy addition.
 
 ```
 firmware/
-  humsienk_bms_webconfig/   Main firmware: web config, MQTT, REST, display, FET control
+  humsienk_bms_webconfig/   Main firmware: web config + live web page, REST, display, FET control
   examples/
-    minimal_mqtt/           Stripped-down: read + MQTT, no display/web (good starting point)
     rest_only/              Read + REST to HA, hardcoded config (simplest)
 docs/
   PROTOCOL.md               Full reverse-engineered BMC protocol spec

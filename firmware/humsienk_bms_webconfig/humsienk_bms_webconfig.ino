@@ -5,6 +5,7 @@
  * Features:
  *   - Reads 1..N Humsienk BMC batteries over BLE (verified protocol)
  *   - Cycles readings on the TTGO display
+ *   - Shows live battery data (SOC, voltage, current, faults) on the web page
  *   - Publishes to Home Assistant via REST API (Nabu Casa or local)
  *   - WEB CONFIG: all settings (WiFi, HA URL/token, battery MACs) set via
  *     a web interface. No recompiling to change config.
@@ -38,7 +39,6 @@
 #include <DNSServer.h>
 #include <Preferences.h>
 #include <ArduinoJson.h>
-#include <PubSubClient.h>
 #include <NimBLEDevice.h>
 #include <TFT_eSPI.h>
 #include <SPI.h>
@@ -74,13 +74,6 @@ struct Config {
     String   haUrl;          // e.g. https://xxx.ui.nabu.casa  (no trailing slash)
     String   haToken;
     bool     haEnabled = true;
-    // MQTT
-    bool     mqttEnabled = false;
-    String   mqttHost;
-    uint16_t mqttPort = 1883;
-    String   mqttUser;
-    String   mqttPass;
-    String   mqttBase = "humsienk";   // base topic
     uint32_t pollMs = POLL_INTERVAL_MS_DEFAULT;
     uint8_t  batteryCount = 0;
     String   batMac[MAX_BATTERIES];
@@ -96,12 +89,6 @@ static void loadConfig() {
     cfg.haUrl    = prefs.getString("haUrl", "");
     cfg.haToken  = prefs.getString("haToken", "");
     cfg.haEnabled = prefs.getBool("haEn", true);
-    cfg.mqttEnabled = prefs.getBool("mqEn", false);
-    cfg.mqttHost = prefs.getString("mqHost", "");
-    cfg.mqttPort = prefs.getUShort("mqPort", 1883);
-    cfg.mqttUser = prefs.getString("mqUser", "");
-    cfg.mqttPass = prefs.getString("mqPass", "");
-    cfg.mqttBase = prefs.getString("mqBase", "humsienk");
     cfg.pollMs   = prefs.getUInt("pollMs", POLL_INTERVAL_MS_DEFAULT);
     cfg.batteryCount = prefs.getUChar("batCount", 0);
     if (cfg.batteryCount > MAX_BATTERIES) cfg.batteryCount = MAX_BATTERIES;
@@ -119,12 +106,6 @@ static void saveConfig() {
     prefs.putString("haUrl",    cfg.haUrl);
     prefs.putString("haToken",  cfg.haToken);
     prefs.putBool("haEn",       cfg.haEnabled);
-    prefs.putBool("mqEn",       cfg.mqttEnabled);
-    prefs.putString("mqHost",   cfg.mqttHost);
-    prefs.putUShort("mqPort",   cfg.mqttPort);
-    prefs.putString("mqUser",   cfg.mqttUser);
-    prefs.putString("mqPass",   cfg.mqttPass);
-    prefs.putString("mqBase",   cfg.mqttBase);
     prefs.putUInt("pollMs",     cfg.pollMs);
     prefs.putUChar("batCount",  cfg.batteryCount);
     for (uint8_t i = 0; i < cfg.batteryCount; i++) {
@@ -538,158 +519,10 @@ static void publishBattery(uint8_t idx, const String& name, const BatterySnapsho
 }
 
 // ============================================================================
-// MQTT  (local broker; supports HA MQTT discovery + FET control topics)
+// FET command queue (from the web UI, applied on next BLE contact)
 // ============================================================================
-WiFiClient   mqttNet;
-PubSubClient mqtt(mqttNet);
-
-// Forward declare: a queued FET command from MQTT, handled in main loop
 struct FetCommand { bool pending=false; uint8_t batIndex; uint8_t cmd; bool on; };
 static FetCommand pendingFet;
-
-static String mqttStateTopic(const String& batName) { return cfg.mqttBase + "/" + batName + "/state"; }
-static String mqttCmdTopicCharge(const String& batName)    { return cfg.mqttBase + "/" + batName + "/charge/set"; }
-static String mqttCmdTopicDischarge(const String& batName) { return cfg.mqttBase + "/" + batName + "/discharge/set"; }
-
-static void mqttCallback(char* topic, byte* payload, unsigned int len) {
-    String t = topic;
-    String msg; for (unsigned i = 0; i < len; i++) msg += (char)payload[i];
-    msg.trim(); msg.toUpperCase();
-    bool on = (msg == "ON" || msg == "1" || msg == "TRUE");
-    for (uint8_t i = 0; i < cfg.batteryCount; i++) {
-        if (t == mqttCmdTopicCharge(cfg.batName[i])) {
-            pendingFet = { true, i, CMD_CHARGE_FET, on }; return;
-        }
-        if (t == mqttCmdTopicDischarge(cfg.batName[i])) {
-            pendingFet = { true, i, CMD_DISCHARGE_FET, on }; return;
-        }
-    }
-}
-
-static void mqttPublishDiscovery() {
-    // Publish HA MQTT-discovery configs so entities + switches auto-appear.
-    if (!mqtt.connected()) return;
-    for (uint8_t i = 0; i < cfg.batteryCount; i++) {
-        const String& n = cfg.batName[i];
-        String devId = cfg.mqttBase + "_" + n;
-        String devBlock = "\"dev\":{\"ids\":[\"" + devId + "\"],\"name\":\"" + n +
-                          "\",\"mf\":\"Humsienk\",\"mdl\":\"BMC LiFePO4\"}";
-        String state = mqttStateTopic(n);
-
-        struct { const char* key; const char* name; const char* unit; const char* dc; const char* tmpl; } sensors[] = {
-            {"soc","SOC","%","battery","{{ value_json.soc }}"},
-            {"voltage","Voltage","V","voltage","{{ value_json.voltage }}"},
-            {"current","Current","A","current","{{ value_json.current }}"},
-            {"power","Power","W","power","{{ value_json.power }}"},
-            {"temperature","Temperature","\\u00b0C","temperature","{{ value_json.temp }}"},
-            {"remaining","Remaining Capacity","Ah","","{{ value_json.remaining_ah }}"},
-            {"soh","SOH","%","","{{ value_json.soh }}"},
-            {"cell_diff","Cell Diff","mV","","{{ value_json.cell_diff_mv }}"},
-        };
-        for (auto& s : sensors) {
-            String cfgTopic = "homeassistant/sensor/" + devId + "_" + s.key + "/config";
-            String payload = "{\"name\":\"" + String(s.name) + "\",";
-            payload += "\"uniq_id\":\"" + devId + "_" + s.key + "\",";
-            payload += "\"stat_t\":\"" + state + "\",";
-            payload += "\"val_tpl\":\"" + String(s.tmpl) + "\",";
-            if (s.unit[0]) payload += "\"unit_of_meas\":\"" + String(s.unit) + "\",";
-            if (s.dc[0])   payload += "\"dev_cla\":\"" + String(s.dc) + "\",\"stat_cla\":\"measurement\",";
-            payload += devBlock + "}";
-            mqtt.publish(cfgTopic.c_str(), payload.c_str(), true);
-        }
-        // Two switches: charge + discharge
-        struct { const char* key; const char* name; String cmdT; const char* tmpl; } sw[] = {
-            {"charge","Charge FET", mqttCmdTopicCharge(n), "{{ value_json.charge }}"},
-            {"discharge","Discharge FET", mqttCmdTopicDischarge(n), "{{ value_json.discharge }}"},
-        };
-        for (auto& w : sw) {
-            String cfgTopic = "homeassistant/switch/" + devId + "_" + w.key + "/config";
-            String payload = "{\"name\":\"" + String(w.name) + "\",";
-            payload += "\"uniq_id\":\"" + devId + "_" + w.key + "\",";
-            payload += "\"cmd_t\":\"" + w.cmdT + "\",";
-            payload += "\"stat_t\":\"" + state + "\",";
-            payload += "\"val_tpl\":\"" + String(w.tmpl) + "\",";
-            payload += "\"pl_on\":\"ON\",\"pl_off\":\"OFF\",";
-            payload += devBlock + "}";
-            mqtt.publish(cfgTopic.c_str(), payload.c_str(), true);
-        }
-        // Binary sensors for every protection / warning / info flag
-        for (uint8_t k = 0; k < STATUS_FLAG_COUNT; k++) {
-            const StatusFlag& fl = STATUS_FLAGS[k];
-            if (fl.bit == 7 || fl.bit == 23) continue;  // FETs are switches, handled above
-            String cfgTopic = "homeassistant/binary_sensor/" + devId + "_" + fl.key + "/config";
-            String payload = "{\"name\":\"" + String(fl.name) + "\",";
-            payload += "\"uniq_id\":\"" + devId + "_" + fl.key + "\",";
-            payload += "\"stat_t\":\"" + state + "\",";
-            payload += "\"val_tpl\":\"{{ value_json." + String(fl.key) + " }}\",";
-            payload += "\"pl_on\":\"ON\",\"pl_off\":\"OFF\",";
-            // Warnings + protections get device_class 'problem' so HA shows them red when active
-            if (fl.isWarning || String(fl.key).indexOf("prot") >= 0 ||
-                String(fl.key) == "afe_error" || String(fl.key) == "short_circuit")
-                payload += "\"dev_cla\":\"problem\",";
-            payload += devBlock + "}";
-            mqtt.publish(cfgTopic.c_str(), payload.c_str(), true);
-        }
-    }
-}
-
-static void mqttReconnect() {
-    if (!cfg.mqttEnabled || cfg.mqttHost.isEmpty()) return;
-    if (mqtt.connected()) return;
-    mqtt.setServer(cfg.mqttHost.c_str(), cfg.mqttPort);
-    mqtt.setBufferSize(1024);
-    mqtt.setCallback(mqttCallback);
-    String cid = "humsienk-" + String((uint32_t)ESP.getEfuseMac(), HEX);
-    bool ok = cfg.mqttUser.isEmpty()
-        ? mqtt.connect(cid.c_str())
-        : mqtt.connect(cid.c_str(), cfg.mqttUser.c_str(), cfg.mqttPass.c_str());
-    if (ok) {
-        Serial.println("MQTT connected");
-        for (uint8_t i = 0; i < cfg.batteryCount; i++) {
-            mqtt.subscribe(mqttCmdTopicCharge(cfg.batName[i]).c_str());
-            mqtt.subscribe(mqttCmdTopicDischarge(cfg.batName[i]).c_str());
-        }
-        mqttPublishDiscovery();
-    } else {
-        Serial.printf("MQTT connect failed rc=%d\n", mqtt.state());
-    }
-}
-
-// FET state cache (so the switch reflects last commanded state)
-static bool chargeState[MAX_BATTERIES];
-static bool dischargeState[MAX_BATTERIES];
-static bool fetStateKnown[MAX_BATTERIES];
-
-static void mqttPublishState(uint8_t i, const BatterySnapshot& s) {
-    if (!mqtt.connected()) return;
-    JsonDocument doc;
-    doc["soc"] = s.soc;
-    doc["voltage"] = round(s.voltage_v * 1000) / 1000.0;
-    doc["current"] = round(s.current_a * 1000) / 1000.0;
-    doc["power"]   = round(s.voltage_v * s.current_a * 10) / 10.0;
-    doc["temp"]    = (int)s.temp_c;
-    doc["soh"]     = s.soh;
-    doc["remaining_ah"] = round(s.remaining_mah / 1000.0 * 100) / 100.0;
-    doc["cycles"]  = s.cycles;
-    doc["cell_diff_mv"] = s.cell_diff_mv;
-    if (s.status_valid) {
-        // Real, read-back FET states (verified bit decode)
-        doc["charge"]    = s.chargeFetOn ? "ON" : "OFF";
-        doc["discharge"] = s.dischargeFetOn ? "ON" : "OFF";
-        // All protection/warning/info flags as ON/OFF
-        for (uint8_t k = 0; k < STATUS_FLAG_COUNT; k++) {
-            const StatusFlag& fl = STATUS_FLAGS[k];
-            if (fl.bit == 7 || fl.bit == 23) continue;  // already covered
-            doc[fl.key] = ((s.status_bits >> fl.bit) & 1) ? "ON" : "OFF";
-        }
-    } else if (fetStateKnown[i]) {
-        // Fallback to last-commanded if a status read hasn't landed yet
-        doc["charge"]    = chargeState[i] ? "ON" : "OFF";
-        doc["discharge"] = dischargeState[i] ? "ON" : "OFF";
-    }
-    String payload; serializeJson(doc, payload);
-    mqtt.publish(mqttStateTopic(cfg.batName[i]).c_str(), payload.c_str(), true);
-}
 
 // ============================================================================
 // Display
@@ -810,6 +643,16 @@ static String htmlHeader(const String& title) {
            "button.sec{background:#333}.bat{border:1px solid #333;border-radius:8px;padding:10px;margin:8px 0}"
            ".hit{display:flex;justify-content:space-between;align-items:center;border:1px solid #2a2a2a;border-radius:6px;padding:8px;margin:6px 0}"
            ".muted{color:#888;font-size:.85em}a{color:#0a84ff}"
+           ".card{border:1px solid #333;border-radius:10px;padding:12px;margin:10px 0;background:#161616}"
+           ".soc-row{display:flex;align-items:center;gap:12px;margin-top:8px}"
+           ".socnum{font-size:1.7em;font-weight:600;min-width:70px}"
+           ".bar{flex:1;height:14px;background:#2a2a2a;border-radius:7px;overflow:hidden}"
+           ".bar>span{display:block;height:100%}"
+           ".grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(84px,1fr));gap:6px;margin-top:10px}"
+           ".stat{background:#1c1c1c;border-radius:6px;padding:6px 8px}"
+           ".stat b{display:block;font-size:1.05em}.stat small{color:#888}"
+           ".fault{color:#ff5b5b;font-size:.85em;margin-top:6px}"
+           ".ok{color:#3ddc84}.off{color:#ff9f0a}"
            "</style></head><body>";
 }
 static String htmlFooter() { return "</body></html>"; }
@@ -819,6 +662,37 @@ static void handleRoot() {
     h += "<h1>Humsienk BMS Monitor</h1>";
     if (apMode) h += "<p class='muted'>Setup mode (AP). Enter your WiFi to connect to your network.</p>";
     else h += "<p class='muted'>Connected: " + WiFi.localIP().toString() + "</p>";
+
+    // Live battery status. Rendered client-side from /status.json and refreshed
+    // every few seconds, so percentages update without reloading the config form.
+    if (!apMode && cfg.batteryCount > 0) {
+        h += "<h2>Batteries</h2><div id='live'><p class='muted'>Loading battery data&hellip;</p></div>";
+        h += "<script>"
+             "function socCol(p,c){if(c)return '#0a84ff';if(p>=50)return '#3ddc84';if(p>=20)return '#ff9f0a';return '#ff375b';}"
+             "function stat(v,l){return \"<div class='stat'><b>\"+v+\"</b><small>\"+l+\"</small></div>\";}"
+             "function render(list){var e=document.getElementById('live');if(!list.length){e.innerHTML=\"<p class='muted'>No batteries.</p>\";return;}var h='';"
+             "list.forEach(function(b){h+=\"<div class='card'><b>\"+b.name+\"</b>\";"
+             "if(!b.valid){h+=\" <span class='muted'>waiting for first read&hellip;</span></div>\";return;}"
+             "var c=b.current>0.1;"
+             "h+=\"<div class='soc-row'><div class='socnum'>\"+b.soc+\"%</div><div class='bar'><span style='width:\"+b.soc+\"%;background:\"+socCol(b.soc,c)+\"'></span></div></div>\";"
+             "h+=\"<div class='grid'>\";"
+             "h+=stat(b.voltage.toFixed(2)+' V','voltage');"
+             "h+=stat((b.current>0?'+':'')+b.current.toFixed(2)+' A','current');"
+             "h+=stat(b.power.toFixed(1)+' W','power');"
+             "h+=stat(b.temp+' \\u00b0C','temp');"
+             "h+=stat(b.remaining_ah.toFixed(1)+' Ah','remaining');"
+             "h+=stat(b.soh+'%','SOH');"
+             "h+=stat(b.cycles,'cycles');"
+             "h+=stat(b.cell_diff+' mV','cell diff');"
+             "h+=\"</div>\";"
+             "if(b.charge_fet!==undefined){h+=\"<div class='muted' style='margin-top:8px'>Charge FET: <b class='\"+(b.charge_fet?'ok':'off')+\"'>\"+(b.charge_fet?'ON':'OFF')+\"</b> &middot; Discharge FET: <b class='\"+(b.discharge_fet?'ok':'off')+\"'>\"+(b.discharge_fet?'ON':'OFF')+\"</b></div>\";}"
+             "if(b.faults&&b.faults.length){h+=\"<div class='fault'>\\u26a0 \"+b.faults.join(', ')+\"</div>\";}"
+             "h+=\"<div class='muted' style='margin-top:6px;font-size:.8em'>updated \"+b.age+\"s ago</div></div>\";});"
+             "e.innerHTML=h;}"
+             "function tick(){fetch('/status.json').then(function(r){return r.json();}).then(render).catch(function(){});}"
+             "tick();setInterval(tick,5000);"
+             "</script>";
+    }
 
     h += "<form method='POST' action='/save'>";
     h += "<h2>WiFi</h2>";
@@ -832,18 +706,10 @@ static void handleRoot() {
     h += "<label>Long-Lived Access Token</label>";
     h += "<input name='hatoken' type='password' value='" + cfg.haToken + "'>";
 
-    h += "<h2>MQTT (local broker)</h2>";
-    h += "<label><input type='checkbox' name='mqen' style='width:auto' " + String(cfg.mqttEnabled ? "checked" : "") + "> Enable MQTT (auto-discovery + switches)</label>";
-    h += "<label>Broker host/IP</label><input name='mqhost' value='" + cfg.mqttHost + "'>";
-    h += "<label>Port</label><input name='mqport' type='number' value='" + String(cfg.mqttPort) + "'>";
-    h += "<label>Username (optional)</label><input name='mquser' value='" + cfg.mqttUser + "'>";
-    h += "<label>Password (optional)</label><input name='mqpass' type='password' value='" + cfg.mqttPass + "'>";
-    h += "<label>Base topic</label><input name='mqbase' value='" + cfg.mqttBase + "'>";
-
     h += "<label>Poll interval (seconds)</label>";
     h += "<input name='poll' type='number' min='10' value='" + String(cfg.pollMs / 1000) + "'>";
 
-    h += "<h2>Batteries (" + String(cfg.batteryCount) + "/" + String(MAX_BATTERIES) + ")</h2>";
+    h += "<h2>Battery config (" + String(cfg.batteryCount) + "/" + String(MAX_BATTERIES) + ")</h2>";
     for (uint8_t i = 0; i < cfg.batteryCount; i++) {
         h += "<div class='bat'>";
         h += "<label>Name</label><input name='bname" + String(i) + "' value='" + cfg.batName[i] + "'>";
@@ -912,6 +778,41 @@ static void handleFet() {
     server.send(200, "text/html", h);
 }
 
+// Live battery data as JSON for the web page's auto-refreshing status cards.
+static void handleStatusJson() {
+    JsonDocument doc;
+    JsonArray arr = doc.to<JsonArray>();
+    for (uint8_t i = 0; i < cfg.batteryCount; i++) {
+        const BatterySnapshot& s = snapshots[i];
+        JsonObject o = arr.add<JsonObject>();
+        o["name"]  = cfg.batName[i];
+        o["valid"] = s.valid;
+        if (!s.valid) continue;
+        o["soc"]          = s.soc;
+        o["voltage"]      = round(s.voltage_v * 100) / 100.0;
+        o["current"]      = round(s.current_a * 100) / 100.0;
+        o["power"]        = round(s.voltage_v * s.current_a * 10) / 10.0;
+        o["temp"]         = (int)s.temp_c;
+        o["soh"]          = s.soh;
+        o["remaining_ah"] = round(s.remaining_mah / 1000.0 * 100) / 100.0;
+        o["cycles"]       = s.cycles;
+        o["cell_diff"]    = s.cell_diff_mv;
+        o["age"]          = (millis() - s.last_update_ms) / 1000;
+        if (s.status_valid) {
+            o["charge_fet"]    = s.chargeFetOn;
+            o["discharge_fet"] = s.dischargeFetOn;
+            JsonArray faults = o["faults"].to<JsonArray>();
+            for (uint8_t k = 0; k < STATUS_FLAG_COUNT; k++) {
+                const StatusFlag& fl = STATUS_FLAGS[k];
+                if (fl.bit == 7 || fl.bit == 23 || fl.bit == 15 || fl.bit == 31) continue; // skip FET/heating info bits
+                if ((s.status_bits >> fl.bit) & 1) faults.add(fl.name);
+            }
+        }
+    }
+    String out; serializeJson(doc, out);
+    server.send(200, "application/json", out);
+}
+
 static void handleScan() {
     drawStatusScreen("BLE scan", "looking for HS...");
     scanForBatteries(5000);
@@ -957,14 +858,6 @@ static void handleSave() {
     cfg.haEnabled = server.hasArg("haen");
     cfg.haUrl    = server.arg("haurl");
     cfg.haToken  = server.arg("hatoken");
-    cfg.mqttEnabled = server.hasArg("mqen");
-    cfg.mqttHost = server.arg("mqhost");
-    cfg.mqttPort = server.arg("mqport").toInt();
-    if (cfg.mqttPort == 0) cfg.mqttPort = 1883;
-    cfg.mqttUser = server.arg("mquser");
-    cfg.mqttPass = server.arg("mqpass");
-    cfg.mqttBase = server.arg("mqbase");
-    if (cfg.mqttBase.isEmpty()) cfg.mqttBase = "humsienk";
     uint32_t pollSec = server.arg("poll").toInt();
     if (pollSec < 10) pollSec = 10;
     cfg.pollMs = pollSec * 1000;
@@ -982,6 +875,7 @@ static void handleSave() {
 
 static void startWebServer() {
     server.on("/", handleRoot);
+    server.on("/status.json", HTTP_GET, handleStatusJson);
     server.on("/save", HTTP_POST, handleSave);
     server.on("/scan", HTTP_POST, handleScan);
     server.on("/add",  HTTP_POST, handleAdd);
@@ -1057,16 +951,7 @@ void loop() {
     server.handleClient();
     pollButtons();
 
-    // MQTT upkeep
-    if (!apMode && cfg.mqttEnabled) {
-        if (!mqtt.connected()) {
-            static uint32_t lastTry = 0;
-            if (millis() - lastTry > 5000) { lastTry = millis(); mqttReconnect(); }
-        }
-        mqtt.loop();
-    }
-
-    // Execute a pending FET command (from web or MQTT) ASAP
+    // Execute a pending FET command (queued from the web UI) ASAP
     if (pendingFet.pending) {
         FetCommand c = pendingFet;          // copy
         pendingFet.pending = false;
@@ -1076,13 +961,6 @@ void loop() {
             Serial.printf("[%s] %s FET -> %s : %s\n", cfg.batName[c.batIndex].c_str(),
                 c.cmd == CMD_CHARGE_FET ? "charge" : "discharge",
                 c.on ? "ON" : "OFF", ok ? "ok" : "FAILED");
-            if (ok) {
-                fetStateKnown[c.batIndex] = true;
-                if (c.cmd == CMD_CHARGE_FET) chargeState[c.batIndex] = c.on;
-                else                         dischargeState[c.batIndex] = c.on;
-                if (cfg.mqttEnabled && mqtt.connected())
-                    mqttPublishState(c.batIndex, snapshots[c.batIndex]);
-            }
         }
     }
 
@@ -1096,22 +974,15 @@ void loop() {
             BatterySnapshot fresh = snapshots[i];
             if (bms.connectAndPoll(cfg.batMac[i], fresh)) {
                 snapshots[i] = fresh;
-                if (fresh.status_valid) {
-                    fetStateKnown[i]   = true;
-                    chargeState[i]     = fresh.chargeFetOn;
-                    dischargeState[i]  = fresh.dischargeFetOn;
-                }
                 Serial.printf("[%s] V=%.2f I=%.2f SOC=%u%% chgFET=%d disFET=%d\n",
                     cfg.batName[i].c_str(), fresh.voltage_v, fresh.current_a, fresh.soc,
                     fresh.chargeFetOn, fresh.dischargeFetOn);
                 publishBattery(i, cfg.batName[i], fresh);
-                if (cfg.mqttEnabled && mqtt.connected()) mqttPublishState(i, fresh);
             } else {
                 Serial.printf("[%s] read failed\n", cfg.batName[i].c_str());
             }
             if (i == currentScreen) drawBatteryScreen(currentScreen);
             server.handleClient();
-            if (cfg.mqttEnabled) mqtt.loop();
             pollButtons();
             delay(300);
         }

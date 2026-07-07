@@ -1,31 +1,35 @@
 # Home Assistant Integration
 
-Two independent paths; you can run either or both. Toggle each in the device's web config.
-
-## MQTT (recommended)
-
-With MQTT enabled and pointed at your broker (e.g. the Mosquitto add-on), the firmware
-publishes **auto-discovery** messages. A device per battery appears under
-**Settings → Devices & Services → MQTT** with no manual YAML.
-
-Entities created per battery (`<name>` is what you set in the web UI, e.g. `battery1`):
-
-- **Sensors:** SOC (%), voltage (V), current (A), power (W), temperature (°C),
-  remaining capacity (Ah), SOH (%), cell voltage diff (mV).
-- **Switches:** Charge FET, Discharge FET.
-- **Binary sensors:** every protection and warning flag, with `device_class: problem`
-  (they show red and read "Problem/OK").
-
-State topic: `humsienk/<name>/state` (JSON). Command topics:
-`humsienk/<name>/charge/set` and `humsienk/<name>/discharge/set` (payload `ON`/`OFF`).
+The firmware pushes each battery's data to Home Assistant over the **REST API**.
+Enable it and set the details in the device's web config. (You can also just watch the
+live data on the device's own web page — see [Web page](#web-page-no-home-assistant-needed).)
 
 ## REST API (e.g. via Nabu Casa)
 
 Enable "REST publishing" and set the HA URL plus a Long-Lived Access Token
 (HA → profile → Security → Long-Lived Access Tokens). Entities are created on first POST.
 
+Entities created per battery (`<name>` is what you set in the web UI, e.g. `battery1`):
+
+- **Sensors:** SOC (%), voltage (V), current (A), power (W), temperature (°C),
+  remaining/full capacity (Ah), SOH (%), cycles, cell voltage diff (mV).
+- **Flag sensors:** every protection and warning flag as a `sensor` with state `on`/`off`
+  (e.g. `sensor.battery1_cell_ov_prot`), plus `sensor.<name>_charge_fet` and
+  `sensor.<name>_discharge_fet` for the MOSFET states.
+
 > REST-created entities have no unique ID, so HA can't manage them from the UI. That's
-> expected and harmless. If you want full device grouping + switches, prefer MQTT.
+> expected and harmless.
+
+> **Charge/discharge control** is done from the device's own web page (the "Charge /
+> Discharge control" section), not from Home Assistant.
+
+## Web page (no Home Assistant needed)
+
+The device serves a config page at its IP (shown on the display and serial monitor). The
+top of that page shows a **live view of every battery** — SOC with a colour-coded bar,
+voltage, current, power, temperature, remaining capacity, SOH, cycles, cell diff, the
+charge/discharge FET states, and any active protection/warning flags. It refreshes every
+few seconds on its own. This works whether or not REST publishing is enabled.
 
 ## Detecting an offline battery (`last_seen`)
 
@@ -73,7 +77,9 @@ automation:
           message: "SOC is {{ states('sensor.battery1_soc') }}%"
 ```
 
-## Example: alert on any protection firing (MQTT binary sensors)
+## Example: alert on any protection firing
+
+The protection/warning flags arrive as `sensor` entities whose state is `on` when active.
 
 ```yaml
 automation:
@@ -81,11 +87,11 @@ automation:
     trigger:
       - platform: state
         entity_id:
-          - binary_sensor.battery1_cell_ov_prot
-          - binary_sensor.battery1_cell_uv_prot
-          - binary_sensor.battery1_short_circuit
-          - binary_sensor.battery1_chg_ot_prot
-          - binary_sensor.battery1_dis_ot_prot
+          - sensor.battery1_cell_ov_prot
+          - sensor.battery1_cell_uv_prot
+          - sensor.battery1_short_circuit
+          - sensor.battery1_chg_ot_prot
+          - sensor.battery1_dis_ot_prot
         to: "on"
     action:
       - service: notify.mobile_app_your_phone
@@ -112,9 +118,6 @@ cards:
       - sensor.battery1_power
       - sensor.battery1_temperature
       - sensor.battery1_remaining_capacity
-      - switch.battery1_charge_fet
-      - switch.battery1_discharge_fet
+      - sensor.battery1_charge_fet
+      - sensor.battery1_discharge_fet
 ```
-
-> **Safety:** putting the FET switches on a dashboard is convenient but means a tap can cut
-> power to your loads. Consider leaving them off shared/quick-access dashboards.
