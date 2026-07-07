@@ -5,7 +5,7 @@
 - **LilyGO TTGO T-Display** (ESP32 + ST7789 240×135). V1.1 tested; V1.0 uses the same
   pins and Setup file.
 - Any other ESP32 works if you remove or stub the `TFT_eSPI` display code — Wi-Fi, BLE,
-  MQTT and REST don't depend on the screen.
+  the web page and REST don't depend on the screen.
 
 No physical connection to the battery is needed; all communication is over BLE. Just power
 the ESP32 from USB within Bluetooth range of the packs.
@@ -17,7 +17,6 @@ the ESP32 from USB within Bluetooth range of the packs.
    - **NimBLE-Arduino** (h2zero) — v2.x. The firmware uses the v2 API
      (`NimBLEDevice::setMTU`, integer connect timeout). On v1.x it won't compile.
    - **ArduinoJson** (Benoit Blanchon) — v7+.
-   - **PubSubClient** (Nick O'Leary) — MQTT.
    - **TFT_eSPI** (Bodmer) — display.
 
 ## TFT_eSPI configuration (display boards only)
@@ -40,7 +39,7 @@ it, the display shows garbage or stays blank, but the rest of the firmware still
 | Upload Speed | 921600 (drop to 115200 if uploads fail) |
 
 The **Huge APP** partition is **required** — the default partition is too small for
-Wi-Fi + TLS + BLE + web server + MQTT and the build will overflow with
+Wi-Fi + TLS + BLE + web server and the build will overflow with
 `text section exceeds available space`.
 
 ## Flashing tips
